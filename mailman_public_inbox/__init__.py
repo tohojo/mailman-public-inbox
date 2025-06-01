@@ -19,13 +19,16 @@
 
 import logging
 import os
+import shlex
+import subprocess
 
 from mailman.config import config
 from mailman.config.config import external_configuration
-from mailman.interfaces.archiver import IArchiver
+from mailman.interfaces.archiver import IArchiver, ArchivePolicy
+from mailman.interfaces.listmanager import ListCreatedEvent, ListDeletingEvent
 from public import public
-from subprocess import PIPE, Popen
 from urllib.parse import urljoin
+from zope.event import classhandler
 from zope.interface import implementer
 
 
@@ -44,27 +47,43 @@ class PublicInbox:
         # Read our specific configuration file
         archiver_config = external_configuration(
             config.archiver.public_inbox.configuration)
+        self.base_url = archiver_config.get('general', 'base_url')
         self.public_inbox_config = archiver_config.get('general', 'pi_config')
         self.public_inbox_home = archiver_config.get('general', 'pi_home')
         self.public_inbox_path = archiver_config.get('general', 'pi_path')
+        self.auto_create = archiver_config.get('general', 'pi_auto_create')
+        self.reload_command = archiver_config.get('general', 'pi_reload_command')
 
         self.pi_config = {}
+
+        if self.auto_create:
+            classhandler.handler(ListCreatedEvent, self.list_created_handler)
+            classhandler.handler(ListDeletingEvent, self.list_deleting_handler)
+
+    def _run_command(self, args, **kwargs):
+        env = os.environ.copy()
+        env['PI_CONFIG'] = self.public_inbox_config
+        env['HOME'] = self.public_inbox_home
+        env['PATH'] = self.public_inbox_path
+
+        if env in kwargs:
+            kwargs['env'].update(env)
+        else:
+            kwargs['env'] = env
+
+        return subprocess.run(args, capture_output=True, **kwargs)
 
     def _parse_publicinbox_config(self):
         if self.pi_config:
             return
-        env = os.environ.copy()
-        env['PATH'] = self.public_inbox_path
 
-        proc = Popen(['git', 'config', '-z', '-l', '--includes',
-                      '--file', self.public_inbox_config],
-                     stdout=PIPE, stderr=PIPE, env=env)
-        stdout, stderr = proc.communicate()
+        proc = self._run_command(['git', 'config', '-z', '-l', '--includes',
+                                  '--file', self.public_inbox_config])
         if proc.returncode != 0:
             log.error('Error (%s) when reading public-inbox config: %s',
-                      proc.returncode, stderr)
+                      proc.returncode, proc.stderr)
 
-        for cfg in stdout.split(b'\0'):
+        for cfg in proc.stdout.split(b'\0'):
             try:
                 k, v = [i.decode() for i in cfg.split(b'\n', 1)]
             except (ValueError, UnicodeDecodeError):
@@ -110,22 +129,74 @@ class PublicInbox:
 
     def archive_message(self, mlist, msg):
         """See `IArchiver`."""
-        env = os.environ.copy()
-        env['ORIGINAL_RECIPIENT'] = mlist.posting_address
-        env['PI_CONFIG'] = self.public_inbox_config
-        env['HOME'] = self.public_inbox_home
-        env['PATH'] = self.public_inbox_path
+        env = {'ORIGINAL_RECIPIENT': mlist.posting_address}
         url = self.permalink(mlist, msg)
 
-        proc = Popen(
-            ['public-inbox-mda', '--no-precheck'],
-            stdin=PIPE, stdout=PIPE, stderr=PIPE,
-            universal_newlines=True, env=env)
-        _, stderr = proc.communicate(msg.as_string())
+        proc = self._run_command(['public-inbox-mda', '--no-precheck'],
+                                 input=msg.as_string(), env=env,
+                                 universal_newlines=True)
         if proc.returncode != 0:
             log.error('%s: public-inbox subprocess exited with error(%s): %s',
-                      msg['message-id'], proc.returncode, stderr)
+                      msg['message-id'], proc.returncode, proc.stderr)
         else:
             log.info('%s: Archived with public-inbox at %s',
                      msg['message-id'], url)
         return url
+
+    def _reload_public_inbox(self):
+        # Clear cached config regardless of whether a reload command is set
+        self.pi_config = {}
+
+        if not self.reload_command:
+            return
+
+        args = shlex.split(self.reload_command)
+        proc = self._run_command(args)
+        if proc.returncode != 0:
+            log.error('Error running public-inbox reload command: %s',
+                      proc.stderr)
+
+    def list_created_handler(self, event):
+        if not self.is_enabled or not self.auto_create:
+            return
+
+        mlist = event.mailing_list
+        if mlist.archive_policy != ArchivePolicy.public or not mlist.advertised:
+            return
+
+        proc = self._run_command(['public-inbox-init', '-V2',
+                                  mlist.list_name,
+                                  os.path.join(self.public_inbox_home, mlist.list_name),
+                                  urljoin(self.base_url, mlist.list_name + "/"),
+                                  mlist.fqdn_listname])
+        if proc.returncode != 0:
+            log.error('Unable to initialise public-inbox archive for list %s: %s',
+                      mlist.list_name, proc.stderr)
+        else:
+            log.info('Initialised public-inbox archive for list %s',
+                     mlist.list_name)
+
+        self._reload_public_inbox()
+
+    def list_deleting_handler(self, event):
+        if not self.is_enabled or not self.auto_create:
+            return
+
+        mlist = event.mailing_list
+        conf = self._get_publicinbox_conf(mlist)
+        if not conf:
+            return
+
+        proc = self._run_command(['git', 'config',
+                                  '--file',
+                                  self.public_inbox_config,
+                                  '--remove-section',
+                                  'publicinbox.' + mlist.list_name])
+        if proc.returncode != 0:
+            log.error('Unable to remove public-inbox config for list %s: %s',
+                      mlist.list_name, proc.stderr)
+        else:
+            log.info('Removed public-inbox config for list %s',
+                     mlist.list_name)
+
+        self._reload_public_inbox()
